@@ -1,0 +1,14 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+.cache/
+.vscode/
+*.bin
+*.elf
+*.map
+.DS_Store
+*.HEIC
+*.jpg
+*.jpeg
+*.png
