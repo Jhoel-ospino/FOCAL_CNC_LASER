@@ -93,11 +93,21 @@ static void stepper_execute_block(plan_block_t *blk)
 #endif
     esp_rom_delay_us(10); // Tiempo de establecimiento de dirección para TMC2209
 
-    // 2. Parámetros de la rampa trapezoidal
-    float v_entry = (blk->entry_speed > 2.0f) ? blk->entry_speed : 2.0f;
-    float v_nominal = (blk->nominal_speed > 2.0f) ? blk->nominal_speed : 2.0f;
-    float v_exit = (blk->exit_speed > 2.0f) ? blk->exit_speed : 2.0f;
-    float accel = (blk->acceleration > 100.0f) ? blk->acceleration : 800.0f;
+    // 2. Parámetros de la rampa cinemática suave y progresiva con S-Curve
+    const float v_min = 0.3f; // mm/s (60 pasos/s - arranque hiper-suave sin zumbido ni resonancia)
+    float v_entry = (blk->entry_speed > v_min) ? blk->entry_speed : v_min;
+    float v_nominal = (blk->nominal_speed > v_min) ? blk->nominal_speed : v_min;
+    float v_exit = (blk->exit_speed > v_min) ? blk->exit_speed : v_min;
+    
+    // Limitar velocidad nominal máxima a 13.33 mm/s (800 mm/min) para husillos T8
+    // Evita la zona crítica de resonancia de banda media (mid-band resonance) en motores NEMA 17 a 12V
+    if (v_nominal > 13.33f) v_nominal = 13.33f;
+    if (v_entry > v_nominal) v_entry = v_nominal;
+    if (v_exit > v_nominal) v_exit = v_nominal;
+
+    // Aceleración suave: default 40 mm/s^2 para X, límite superior 80 mm/s^2 para proteger par motor
+    float accel = (blk->acceleration >= 10.0f) ? blk->acceleration : 40.0f;
+    if (accel > 80.0f) accel = 80.0f;
 
     // Distancias de aceleración y desaceleración
     float d_accel = 0.0f;
@@ -112,12 +122,27 @@ static void stepper_execute_block(plan_block_t *blk)
     // Si el bloque es muy corto para alcanzar velocidad nominal (perfil triangular)
     if (d_accel + d_decel > dist) {
         float v_peak_sq = (2.0f * accel * dist + v_entry * v_entry + v_exit * v_exit) / 2.0f;
-        if (v_peak_sq > 4.0f) {
+        if (v_peak_sq > (v_min * v_min)) {
             v_nominal = sqrtf(v_peak_sq);
-            d_accel = (v_nominal * v_nominal - v_entry * v_entry) / (2.0f * accel);
-            d_decel = dist - d_accel;
+            if (v_nominal > v_entry) {
+                d_accel = (v_nominal * v_nominal - v_entry * v_entry) / (2.0f * accel);
+            } else {
+                d_accel = 0.0f;
+            }
+            if (v_nominal > v_exit) {
+                d_decel = (v_nominal * v_nominal - v_exit * v_exit) / (2.0f * accel);
+            } else {
+                d_decel = 0.0f;
+            }
+            if (d_accel + d_decel > dist) {
+                float excess = (d_accel + d_decel) - dist;
+                d_accel -= excess * 0.5f;
+                d_decel -= excess * 0.5f;
+                if (d_accel < 0.0f) d_accel = 0.0f;
+                if (d_decel < 0.0f) d_decel = 0.0f;
+            }
         } else {
-            v_nominal = 2.0f;
+            v_nominal = v_min;
             d_accel = 0.0f;
             d_decel = 0.0f;
         }
@@ -126,7 +151,7 @@ static void stepper_execute_block(plan_block_t *blk)
     uint32_t counter_x = total_steps / 2;
     uint32_t counter_y = total_steps / 2;
 
-    // 3. Bucle de emisión determinista paso a paso
+    // 3. Bucle de emisión determinista paso a paso con S-Curve armónica
     for (uint32_t step = 0; step < total_steps; step++) {
         // Verificar si se solicitó pausa o parada de emergencia
         if (s_cnc_state == CNC_STATE_HOLD || s_cnc_state == CNC_STATE_IDLE) {
@@ -137,19 +162,22 @@ static void stepper_execute_block(plan_block_t *blk)
         // Posición actual a lo largo de la trayectoria
         float s = (float)step * dist / (float)total_steps;
 
-        // Calcular velocidad instantánea v(s)
+        // Calcular velocidad instantánea v(s) con Rampa S-Curve armónica (Jerk = 0)
         float v = v_nominal;
-        if (s < d_accel && d_accel > 0.001f) {
-            float v_sq = v_entry * v_entry + 2.0f * accel * s;
-            v = (v_sq > 4.0f) ? sqrtf(v_sq) : 2.0f;
-        } else if (s > (dist - d_decel) && d_decel > 0.001f) {
-            float s_decel = dist - s;
-            float v_sq = v_exit * v_exit + 2.0f * accel * s_decel;
-            v = (v_sq > 4.0f) ? sqrtf(v_sq) : 2.0f;
+        if (s < d_accel && d_accel > 0.0001f) {
+            // Rampa sinusoidal de aceleración (arranque suave con pendiente cero en los extremos)
+            float tau = s / d_accel; // 0.0 a 1.0
+            float factor = 0.5f * (1.0f - cosf((float)M_PI * tau));
+            v = v_entry + (v_nominal - v_entry) * factor;
+        } else if (s > (dist - d_decel) && d_decel > 0.0001f) {
+            // Rampa sinusoidal de desaceleración (frenado suave con pendiente cero en los extremos)
+            float tau = (dist - s) / d_decel; // 1.0 baja a 0.0
+            float factor = 0.5f * (1.0f - cosf((float)M_PI * tau));
+            v = v_exit + (v_nominal - v_exit) * factor;
         }
 
-        if (v < 2.0f) v = 2.0f;
-        if (v > 50.0f) v = 50.0f; // 3000 mm/min límite seguro para husillo T8
+        if (v < v_min) v = v_min;
+        if (v > 13.33f) v = 13.33f; // 800 mm/min (13.33 mm/s) límite anti-resonancia seguro para husillo T8
 
         // Modulación dinámica de potencia láser M4
         if (blk->dynamic_laser) {
@@ -162,10 +190,10 @@ static void stepper_execute_block(plan_block_t *blk)
 
         // Periodo entre pasos (en microsegundos)
         // R = (total_steps / dist) * v (pasos/segundo)
-        float step_rate = (dist > 0.0001f) ? ((float)total_steps / dist) * v : 800.0f;
+        float step_rate = (dist > 0.0001f) ? ((float)total_steps / dist) * v : 200.0f;
         uint32_t delay_us = (uint32_t)(1000000.0f / step_rate);
-        if (delay_us < 40) delay_us = 40;     // Max 25 kHz
-        if (delay_us > 2500) delay_us = 2500; // Min 400 Hz
+        if (delay_us < 50) delay_us = 50;       // Max 20 kHz
+        if (delay_us > 10000) delay_us = 10000; // Min 100 Hz (arranque inicial suave)
 
         // Algoritmo DDA Bresenham
         bool pulse_x = false;
@@ -190,8 +218,8 @@ static void stepper_execute_block(plan_block_t *blk)
             gpio_set_level(PIN_STEP_Y2, 1);
         }
 
-        // Ancho de pulso TMC2209 (4 microsegundos)
-        esp_rom_delay_us(4);
+        // Ancho de pulso TMC2209 (6 microsegundos para margen de ruido en protoboard)
+        esp_rom_delay_us(6);
 
         // Flanco de bajada
         if (pulse_x) gpio_set_level(PIN_STEP_X, 0);
@@ -201,8 +229,8 @@ static void stepper_execute_block(plan_block_t *blk)
         }
 
         // Espera del periodo de paso restante
-        if (delay_us > 4) {
-            esp_rom_delay_us(delay_us - 4);
+        if (delay_us > 6) {
+            esp_rom_delay_us(delay_us - 6);
         }
     }
 }
@@ -215,23 +243,7 @@ static void task_motion_realtime(void *pvParameters)
     ESP_LOGI(TAG, "Tarea de Control de Movimiento iniciada en Core %d (Prioridad %d).", 
              xPortGetCoreID(), (int)uxTaskPriorityGet(NULL));
 
-    // TEST DE DIAGNOSTICO EN ARRANQUE:
-    // Emite una ráfaga suave de 150 pulsos a 350 Hz en los 3 motores (X, Y1, Y2).
-    // Si la fuente de 12V y los cables están conectados, los motores emitirán un zumbido
-    // audible y claro de 0.4 segundos, confirmando vida física.
-    ESP_LOGI(TAG, ">>> INICIANDO TEST DE DIAGNOSTICO FISICO DE MOTORES (0.4s @ 350Hz)...");
     stepper_timer_enable_motors(true);
-    for (int i = 0; i < 150; i++) {
-        gpio_set_level(PIN_STEP_X, 1);
-        gpio_set_level(PIN_STEP_Y1, 1);
-        gpio_set_level(PIN_STEP_Y2, 1);
-        esp_rom_delay_us(5);
-        gpio_set_level(PIN_STEP_X, 0);
-        gpio_set_level(PIN_STEP_Y1, 0);
-        gpio_set_level(PIN_STEP_Y2, 0);
-        esp_rom_delay_us(2800); // 2.8 ms = ~350 Hz (frecuencia acústica claramente audible)
-    }
-    ESP_LOGI(TAG, ">>> TEST DE DIAGNOSTICO FISICO DE MOTORES COMPLETADO.");
 
     while (1) {
         if (s_cnc_state != CNC_STATE_RUN) {

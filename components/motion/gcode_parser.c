@@ -173,6 +173,10 @@ bool gcode_parser_execute_line(const char *line, char *response_buf, size_t max_
 
     if (is_jog) {
         s_coord_mode = saved_coord_mode; // Restore modal coordinate mode after jog
+        // Limitar feedrate de jogging a un rango suave y seguro anti-resonancia (max 800 mm/min) para husillos T8
+        if (s_feedrate > 800.0f) {
+            s_feedrate = 800.0f;
+        }
     }
 
     if (is_motion && (has_x || has_y)) {

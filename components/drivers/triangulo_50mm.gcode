@@ -1,0 +1,12 @@
+; Focal CNC - Triangulo Equilatero Test L=50mm
+; Dimensiones: 50mm por lado, Centrado X51 Y41 (Cama 102x82mm)
+G90 G21
+M5
+G0 X26.000 Y19.349 F600
+M3 S450
+G1 X76.000 Y19.349 F400
+G1 X51.000 Y62.651 F400
+G1 X26.000 Y19.349 F400
+M5
+G0 X0.000 Y0.000 F600
+M2

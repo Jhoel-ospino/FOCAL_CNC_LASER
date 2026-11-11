@@ -57,6 +57,9 @@ esp_err_t buzzer_init(void)
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
+    // Máxima capacidad de corriente en GPIO 38 para excitar el buzzer pasivo (40 mA)
+    gpio_set_drive_capability(PIN_NUM_BUZZER, GPIO_DRIVE_CAP_3);
+
     buzzer_stop();
     return ESP_OK;
 }
@@ -82,15 +85,23 @@ typedef enum {
 static void buzzer_pattern_task(void *pvParameters)
 {
     buzzer_pattern_t pattern = (buzzer_pattern_t)(uintptr_t)pvParameters;
+    ESP_LOGI(TAG, "Reproduciendo patron acustico en GPIO %d (patron %d)...", PIN_NUM_BUZZER, (int)pattern);
 
     if (pattern == BUZZER_PAT_JOB_COMPLETE) {
-        // Secuencia triple de fin de trabajo: 3 beeps de 100ms a 2.5 kHz
-        for (int i = 0; i < 3; i++) {
-            buzzer_hw_tone(2500, 40);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            buzzer_hw_tone(0, 0);
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
+        // Melodía ascendente de fin de trabajo: 3 beeps claros a resonancia acústica (50% duty)
+        buzzer_hw_tone(2048, 50);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        buzzer_hw_tone(0, 0);
+        vTaskDelay(pdMS_TO_TICKS(80));
+
+        buzzer_hw_tone(2400, 50);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        buzzer_hw_tone(0, 0);
+        vTaskDelay(pdMS_TO_TICKS(80));
+
+        buzzer_hw_tone(2700, 50);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        buzzer_hw_tone(0, 0);
     } else if (pattern == BUZZER_PAT_ALERT) {
         // Alerta de seguridad intermitente rápida
         for (int i = 0; i < 5; i++) {
@@ -108,14 +119,15 @@ static void buzzer_pattern_task(void *pvParameters)
 void buzzer_play_job_complete(void)
 {
     if (s_buzzer_task_handle != NULL) return; // Ya hay un patrón sonando
+    ESP_LOGI(TAG, "Solicitado aviso acustico de corte finalizado (BUZZER_PAT_JOB_COMPLETE).");
     xTaskCreate(buzzer_pattern_task, "buzzer_pat", 2048, 
-                (void *)(uintptr_t)BUZZER_PAT_JOB_COMPLETE, 2, &s_buzzer_task_handle);
+                (void *)(uintptr_t)BUZZER_PAT_JOB_COMPLETE, 5, &s_buzzer_task_handle);
 }
 
 void buzzer_play_alert(void)
 {
     if (s_buzzer_task_handle != NULL) return;
     xTaskCreate(buzzer_pattern_task, "buzzer_pat", 2048, 
-                (void *)(uintptr_t)BUZZER_PAT_ALERT, 2, &s_buzzer_task_handle);
+                (void *)(uintptr_t)BUZZER_PAT_ALERT, 5, &s_buzzer_task_handle);
 }
 

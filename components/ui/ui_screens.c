@@ -24,7 +24,10 @@
 #include "gcode_parser.h"
 #include "ili9488_lvgl.h"
 #include "laser_driver.h"
+#include "buzzer_driver.h"
+#include "gcode_streamer.h"
 #include "settings_manager.h"
+#include "planner.h"
 #include "wifi_manager.h"
 #if defined(ESP_PLATFORM)
 #include "sd_card.h"
@@ -96,8 +99,8 @@ static void create_settings_screen(void);
 static void create_bed_dimensions_screen(void);
 
 // Machine Bed Dimensions and Orientation state (in mm and deg)
-static int s_bed_w_mm = 160;
-static int s_bed_h_mm = 200;
+static int s_bed_w_mm = 102;
+static int s_bed_h_mm = 82;
 static int s_bed_rot = 0; // 0, 90, 180, 270
 
 // Settings handles and state
@@ -220,10 +223,19 @@ static lv_obj_t *s_mon_lbl_remaining = NULL;
 static lv_obj_t *s_mon_btn_led = NULL;
 static lv_obj_t *s_mon_btn_pause_resume = NULL;
 static lv_obj_t *s_mon_btn_stop = NULL;
+static lv_obj_t *s_mon_empty_placeholder = NULL;
 static lv_obj_t *s_stop_modal = NULL;
+static lv_obj_t *s_complete_modal = NULL;
+static lv_obj_t *s_complete_modal_info_lbl = NULL;
+static lv_obj_t *s_upload_modal = NULL;
+static lv_obj_t *s_upload_file_lbl = NULL;
+static lv_obj_t *s_upload_bar = NULL;
+static lv_obj_t *s_upload_pct_lbl = NULL;
 static bool s_machine_light_on = false;
 static void update_mon_pause_btn(bool is_cutting);
-static char s_selected_file[64] = "prueba_mario.gcode";
+static void ui_set_monitor_idle_internal(void);
+static void ui_set_monitor_cutting_internal(const char *filename);
+static char s_selected_file[64] = "circulo_50mm.gcode";
 
 // Forward UI state handles for dynamic theme updating
 static lv_obj_t *s_bed_obj = NULL;
@@ -1022,8 +1034,12 @@ static void update_shapes_bed_geometry(void) {
 
 static void update_dro_display(void) {
   char buf[24];
-  float wx = s_mach_x - s_vhome_x;
-  float wy = s_mach_y - s_vhome_y;
+  float cur_x = 0.0f, cur_y = 0.0f;
+  planner_get_position(&cur_x, &cur_y);
+  s_mach_x = cur_x;
+  s_mach_y = cur_y;
+  float wx = cur_x;
+  float wy = cur_y;
   s_sim_x = wx;
   s_sim_y = wy;
   if (s_dro_x) {
@@ -1126,25 +1142,28 @@ static void on_jog_btn_cb(lv_event_t *e) {
   char resp[32];
 
   if (strcmp(dir, "ZERO") == 0) {
-    // Relative virtual home: current head position becomes work coordinate (0,0)
-    s_vhome_x = s_mach_x;
-    s_vhome_y = s_mach_y;
+    // Current head position becomes work coordinate (0,0)
     strcpy(cmd, "G92 X0 Y0");
     gcode_parser_execute_line(cmd, resp, sizeof(resp));
+    s_vhome_x = 0.0f;
+    s_vhome_y = 0.0f;
+    s_mach_x = 0.0f;
+    s_mach_y = 0.0f;
+    update_dro_display();
   } else if (strcmp(dir, "HOME_REL") == 0 || strcmp(dir, "HOME") == 0) {
-    // Return to relative/work (0,0) (virtual home position)
-    s_mach_x = s_vhome_x;
-    s_mach_y = s_vhome_y;
-    snprintf(cmd, sizeof(cmd), "G90 G0 X%.2f Y%.2f F3000", s_mach_x, s_mach_y);
+    // Return to work origin (0,0)
+    snprintf(cmd, sizeof(cmd), "G90 G0 X0.00 Y0.00 F1500");
     gcode_parser_execute_line(cmd, resp, sizeof(resp));
+    update_dro_display();
   } else if (strcmp(dir, "HOME_ABS") == 0) {
     // Machine home: physical movement to absolute origin (0,0)
+    strcpy(cmd, "$H");
+    gcode_parser_execute_line(cmd, resp, sizeof(resp));
     s_mach_x = 0.0f;
     s_mach_y = 0.0f;
     s_vhome_x = 0.0f;
     s_vhome_y = 0.0f;
-    strcpy(cmd, "$H");
-    gcode_parser_execute_line(cmd, resp, sizeof(resp));
+    update_dro_display();
   } else {
     // Directional jog: transformed by bed rotation so visual UP is always visual UP
     float dx = 0.0f;
@@ -1422,13 +1441,13 @@ static void update_shapes_favorite_buttons(void);
 
 #define NUM_SD_SAMPLE_FILES 8
 static char s_sd_files[NUM_SD_SAMPLE_FILES][64] = {
+    "circulo_50mm.gcode",
+    "cuadrado_50mm.gcode",
+    "triangulo_50mm.gcode",
     "prueba_mario.gcode",
     "corte_circulo_50mm.gcode",
     "calibracion_cama.gcode",
-    "caja_ensamble.gcode",
     "soporte_laser.gcode",
-    "engranaje_24d.gcode",
-    "plantilla_corte.gcode",
     "panel_frontal.gcode"
 };
 static bool s_sd_file_deleted[NUM_SD_SAMPLE_FILES] = {false};
@@ -1619,24 +1638,44 @@ static void on_sd_lp_timer_cb(lv_timer_t *t) {
 static lv_obj_t *s_cut_modal = NULL;
 static lv_obj_t *s_cut_modal_file_lbl = NULL;
 static lv_obj_t *s_cut_modal_info_lbl = NULL;
-static char s_pending_cut_file[64] = "prueba_mario.gcode";
-static uint32_t s_pending_lines = 9057;
-static uint32_t s_pending_est_sec = 210;
+static char s_pending_cut_file[64] = "circulo_50mm.gcode";
+static uint32_t s_pending_lines = 76;
+static uint32_t s_pending_est_sec = 18;
+static uint32_t s_last_cut_elapsed_sec = 0;
+
+static void on_streamer_progress_cb(float progress_pct, uint32_t current_line,
+                                    uint32_t total_lines, uint32_t elapsed_sec) {
+  s_last_cut_elapsed_sec = elapsed_sec;
+  if (lvgl_port_lock(100)) {
+    ui_update_cut_monitor(progress_pct, current_line, total_lines, elapsed_sec, 45, 800);
+    lvgl_port_unlock();
+  }
+}
+
+static void on_streamer_complete_cb(bool success) {
+  if (lvgl_port_lock(100)) {
+    ui_set_cutting_state(false);
+    ui_set_monitor_idle_internal();
+    if (success) {
+      ui_update_status("COMPLETADO", FOCAL_HEX_PASTEL_MINT);
+      buzzer_play_job_complete();
+      ui_show_complete_modal(s_pending_cut_file, s_last_cut_elapsed_sec, s_pending_lines);
+    } else {
+      ui_update_status("DETENIDO", FOCAL_HEX_PASTEL_RED);
+    }
+    lvgl_port_unlock();
+  }
+}
 
 static void on_cut_modal_cancel_cb(lv_event_t *e) { ui_close_cut_modal(); }
 
 static void on_cut_modal_confirm_cb(lv_event_t *e) {
   ui_close_cut_modal();
   ui_switch_screen(UI_SCREEN_CUT_MONITOR);
+  ui_set_monitor_cutting_internal(s_pending_cut_file);
   ui_set_cutting_state(true);
   ui_update_status("CORTANDO", FOCAL_HEX_PASTEL_MINT);
-  if (s_cut_liquid_wave) {
-    liquid_wave_progress_load_file(s_cut_liquid_wave, s_pending_cut_file);
-    liquid_wave_progress_set_progress(s_cut_liquid_wave, 0.0f);
-  }
-  if (s_mon_lbl_filename) {
-    lv_label_set_text(s_mon_lbl_filename, s_pending_cut_file);
-  }
+  gcode_streamer_start(s_pending_cut_file, on_streamer_progress_cb, on_streamer_complete_cb);
 }
 
 static void on_preview_ready_cb(gcode_preview_view_t *view,
@@ -2007,8 +2046,152 @@ static void create_sd_screen(void) {
 // =============================================================================
 // SCREEN 3: MONITOR DE CORTE Y TELEMETRIA EN VIVO (SPLIT LAYOUT)
 // =============================================================================
+static void ui_set_monitor_idle_internal(void) {
+  // 1. Mostrar placeholder vacio y ocultar progreso liquid wave y porcentaje
+  if (s_mon_empty_placeholder) {
+    lv_obj_clear_flag(s_mon_empty_placeholder, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (s_cut_liquid_wave) {
+    lv_obj_t *w = liquid_wave_progress_get_obj(s_cut_liquid_wave);
+    if (w) lv_obj_add_flag(w, LV_OBJ_FLAG_HIDDEN);
+    liquid_wave_progress_set_animating(s_cut_liquid_wave, false);
+    liquid_wave_progress_set_progress(s_cut_liquid_wave, 0.0f);
+  }
+  if (s_mon_lbl_pct) {
+    lv_obj_add_flag(s_mon_lbl_pct, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // 2. Limpiar textos e informaciones de archivo
+  if (s_mon_lbl_filename) {
+    lv_label_set_text(s_mon_lbl_filename, "Ningun archivo en curso");
+    lv_obj_set_style_text_color(s_mon_lbl_filename, lv_color_hex(0x6B7280), 0);
+  }
+  if (s_mon_lbl_elapsed) {
+    lv_label_set_text(s_mon_lbl_elapsed, "Transcurrido: --:-- min");
+    lv_obj_set_style_text_color(s_mon_lbl_elapsed, lv_color_hex(0x6B7280), 0);
+  }
+  if (s_mon_lbl_remaining) {
+    lv_label_set_text(s_mon_lbl_remaining, "Restante: --:-- min");
+    lv_obj_set_style_text_color(s_mon_lbl_remaining, lv_color_hex(0x6B7280), 0);
+  }
+  if (s_mon_lbl_lines) {
+    lv_label_set_text(s_mon_lbl_lines, "Lineas: -- / --");
+    lv_obj_set_style_text_color(s_mon_lbl_lines, lv_color_hex(0x6B7280), 0);
+  }
+
+  // 3. Deshabilitar boton Detener (gris, no pulsable)
+  if (s_mon_btn_stop) {
+    lv_obj_clear_flag(s_mon_btn_stop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_style(s_mon_btn_stop, &focal_style_btn_danger, 0);
+    lv_obj_add_style(s_mon_btn_stop, &focal_style_btn_secondary, 0);
+    lv_obj_t *img_s = lv_obj_get_child(s_mon_btn_stop, 0);
+    if (img_s) lv_obj_set_style_img_recolor(img_s, lv_color_hex(0x6B7280), 0);
+    lv_obj_t *lbl_s = lv_obj_get_child(s_mon_btn_stop, 1);
+    if (lbl_s) lv_obj_set_style_text_color(lbl_s, lv_color_hex(0x6B7280), 0);
+  }
+
+  // 4. Deshabilitar boton Pausar/Reanudar (gris, no pulsable)
+  if (s_mon_btn_pause_resume) {
+    lv_obj_clear_flag(s_mon_btn_pause_resume, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_style(s_mon_btn_pause_resume, &focal_style_btn_amber, 0);
+    lv_obj_remove_style(s_mon_btn_pause_resume, &focal_style_btn_mint, 0);
+    lv_obj_add_style(s_mon_btn_pause_resume, &focal_style_btn_secondary, 0);
+    lv_obj_t *img_p = lv_obj_get_child(s_mon_btn_pause_resume, 0);
+    if (img_p) {
+      lv_img_set_src(img_p, &focal_icon_pause);
+      lv_obj_set_style_img_recolor(img_p, lv_color_hex(0x6B7280), 0);
+    }
+    lv_obj_t *lbl_p = lv_obj_get_child(s_mon_btn_pause_resume, 1);
+    if (lbl_p) {
+      lv_label_set_text(lbl_p, "Pausar");
+      lv_obj_set_style_text_color(lbl_p, lv_color_hex(0x6B7280), 0);
+      lv_obj_set_flex_grow(lbl_p, 0);
+    }
+  }
+}
+
+static void ui_set_monitor_cutting_internal(const char *filename) {
+  // 1. Ocultar placeholder vacio y mostrar liquid wave
+  if (s_mon_empty_placeholder) {
+    lv_obj_add_flag(s_mon_empty_placeholder, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (s_cut_liquid_wave) {
+    lv_obj_t *w = liquid_wave_progress_get_obj(s_cut_liquid_wave);
+    if (w) lv_obj_clear_flag(w, LV_OBJ_FLAG_HIDDEN);
+    if (filename && filename[0]) {
+      liquid_wave_progress_load_file(s_cut_liquid_wave, filename);
+    }
+    liquid_wave_progress_set_progress(s_cut_liquid_wave, 0.0f);
+    liquid_wave_progress_set_animating(s_cut_liquid_wave, true);
+  }
+  if (s_mon_lbl_pct) {
+    lv_label_set_text(s_mon_lbl_pct, "0.0%");
+    lv_obj_clear_flag(s_mon_lbl_pct, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  // 2. Cargar textos del archivo activo
+  if (s_mon_lbl_filename) {
+    lv_label_set_text(s_mon_lbl_filename, filename ? filename : "Corte");
+    lv_obj_set_style_text_color(s_mon_lbl_filename, FOCAL_COLOR_PASTEL_BLUE, 0);
+  }
+  if (s_mon_lbl_elapsed) {
+    lv_label_set_text(s_mon_lbl_elapsed, "Transcurrido: 00:00 min");
+    lv_obj_set_style_text_color(
+        s_mon_lbl_elapsed,
+        s_is_dark ? lv_color_hex(0xF9FAFB) : lv_color_hex(0x111827), 0);
+  }
+  if (s_mon_lbl_remaining) {
+    lv_label_set_text(s_mon_lbl_remaining, "Restante: Calculando...");
+    lv_obj_set_style_text_color(s_mon_lbl_remaining, FOCAL_COLOR_PASTEL_AMBER, 0);
+  }
+  if (s_mon_lbl_lines) {
+    lv_label_set_text(s_mon_lbl_lines, "Lineas: 0 / ...");
+    lv_obj_set_style_text_color(
+        s_mon_lbl_lines,
+        s_is_dark ? lv_color_hex(0x9CA3AF) : lv_color_hex(0x6B7280), 0);
+  }
+
+  // 3. Habilitar boton Detener (Rojo Peligro, interactivo)
+  if (s_mon_btn_stop) {
+    lv_obj_add_flag(s_mon_btn_stop, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_style(s_mon_btn_stop, &focal_style_btn_secondary, 0);
+    lv_obj_add_style(s_mon_btn_stop, &focal_style_btn_danger, 0);
+    lv_obj_t *img_s = lv_obj_get_child(s_mon_btn_stop, 0);
+    if (img_s) lv_obj_set_style_img_recolor(img_s, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_t *lbl_s = lv_obj_get_child(s_mon_btn_stop, 1);
+    if (lbl_s) lv_obj_set_style_text_color(lbl_s, lv_color_hex(0xFFFFFF), 0);
+  }
+
+  // 4. Habilitar boton Pausar (Ambar, interactivo)
+  if (s_mon_btn_pause_resume) {
+    lv_obj_add_flag(s_mon_btn_pause_resume, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_style(s_mon_btn_pause_resume, &focal_style_btn_secondary, 0);
+    lv_obj_remove_style(s_mon_btn_pause_resume, &focal_style_btn_mint, 0);
+    lv_obj_add_style(s_mon_btn_pause_resume, &focal_style_btn_amber, 0);
+    lv_obj_t *img_p = lv_obj_get_child(s_mon_btn_pause_resume, 0);
+    if (img_p) {
+      lv_img_set_src(img_p, &focal_icon_pause);
+      lv_obj_set_style_img_recolor(img_p, lv_color_hex(0xFFFFFF), 0);
+    }
+    lv_obj_t *lbl_p = lv_obj_get_child(s_mon_btn_pause_resume, 1);
+    if (lbl_p) {
+      lv_label_set_text(lbl_p, "Pausar");
+      lv_obj_set_style_text_color(lbl_p, lv_color_hex(0xFFFFFF), 0);
+      lv_obj_set_flex_grow(lbl_p, 0);
+    }
+  }
+}
+
 static void update_mon_pause_btn(bool is_cutting) {
   if (!s_mon_btn_pause_resume) return;
+
+  if (!is_cutting && !gcode_streamer_is_running()) {
+    ui_set_monitor_idle_internal();
+    return;
+  }
+
+  lv_obj_add_flag(s_mon_btn_pause_resume, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_remove_style(s_mon_btn_pause_resume, &focal_style_btn_secondary, 0);
   lv_obj_remove_style(s_mon_btn_pause_resume, &focal_style_btn_amber, 0);
   lv_obj_remove_style(s_mon_btn_pause_resume, &focal_style_btn_mint, 0);
 
@@ -2023,6 +2206,7 @@ static void update_mon_pause_btn(bool is_cutting) {
     }
     if (lbl) {
       lv_label_set_text(lbl, "Pausar");
+      lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
       lv_obj_set_flex_grow(lbl, 0);
     }
   } else {
@@ -2033,6 +2217,7 @@ static void update_mon_pause_btn(bool is_cutting) {
     }
     if (lbl) {
       lv_label_set_text(lbl, "Reanudar");
+      lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
       lv_obj_set_flex_grow(lbl, 0);
     }
   }
@@ -2069,21 +2254,37 @@ static void on_cut_light_toggle_cb(lv_event_t *e) {
 
 static void on_cut_pause_resume_cb(lv_event_t *e) {
   (void)e;
+  if (!gcode_streamer_is_running() && !s_is_cutting) return;
   char resp[32];
   if (s_is_cutting) {
+    gcode_streamer_pause(true);
     gcode_parser_execute_line("!", resp, sizeof(resp));
     ui_set_cutting_state(false);
     ui_update_status("EN PAUSA", FOCAL_HEX_PASTEL_AMBER);
+    if (s_cut_liquid_wave) {
+      liquid_wave_progress_set_animating(s_cut_liquid_wave, false);
+    }
   } else {
+    gcode_streamer_pause(false);
     gcode_parser_execute_line("~", resp, sizeof(resp));
     ui_set_cutting_state(true);
     ui_update_status("CORTANDO", FOCAL_HEX_PASTEL_MINT);
+    if (s_cut_liquid_wave) {
+      liquid_wave_progress_set_animating(s_cut_liquid_wave, true);
+    }
   }
 }
 
 static void on_cut_stop_requested_cb(lv_event_t *e) {
   (void)e;
-  ui_show_stop_modal(true);
+  ui_show_stop_modal(false);
+  gcode_streamer_stop();
+  laser_set_power(0);
+  laser_set_enable(false);
+  ui_set_cutting_state(false);
+  ui_set_monitor_idle_internal();
+  ui_update_status("DETENIDO", FOCAL_HEX_PASTEL_RED);
+  buzzer_play_alert();
 }
 
 static void on_stop_modal_cancel_cb(lv_event_t *e) {
@@ -2094,13 +2295,23 @@ static void on_stop_modal_cancel_cb(lv_event_t *e) {
 static void on_stop_modal_confirm_cb(lv_event_t *e) {
   (void)e;
   ui_show_stop_modal(false);
+  gcode_streamer_stop();
   laser_set_power(0);
   laser_set_enable(false);
   char resp[32];
   gcode_parser_execute_line("!", resp, sizeof(resp));
   ui_set_cutting_state(false);
+  ui_set_monitor_idle_internal();
   ui_update_status("DETENIDO", FOCAL_HEX_PASTEL_RED);
   ui_switch_screen(UI_SCREEN_LAUNCHER);
+}
+
+static void on_complete_modal_accept_cb(lv_event_t *e) {
+  (void)e;
+  if (s_complete_modal) {
+    lv_obj_add_flag(s_complete_modal, LV_OBJ_FLAG_HIDDEN);
+  }
+  ui_set_monitor_idle_internal();
 }
 
 static void create_cut_monitor_screen(void) {
@@ -2133,6 +2344,32 @@ static void create_cut_monitor_screen(void) {
     lv_obj_t *wave_obj = liquid_wave_progress_get_obj(s_cut_liquid_wave);
     lv_obj_align(wave_obj, LV_ALIGN_CENTER, 0, 10);
   }
+
+  // Placeholder visual cuando no hay trabajo de corte activo
+  s_mon_empty_placeholder = lv_obj_create(card_left);
+  lv_obj_set_size(s_mon_empty_placeholder, 196, 230);
+  lv_obj_align(s_mon_empty_placeholder, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_opa(s_mon_empty_placeholder, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(s_mon_empty_placeholder, 0, 0);
+  lv_obj_clear_flag(s_mon_empty_placeholder, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(s_mon_empty_placeholder, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(s_mon_empty_placeholder, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(s_mon_empty_placeholder, 10, 0);
+
+  // Icono descriptivo de archivo/documento en reposo
+  focal_create_icon(s_mon_empty_placeholder, &focal_icon_files, 0x6B7280);
+
+  lv_obj_t *lbl_ep_title = lv_label_create(s_mon_empty_placeholder);
+  lv_label_set_text(lbl_ep_title, "Sin Corte Activo");
+  lv_obj_set_style_text_color(lbl_ep_title, lv_color_hex(0x9CA3AF), 0);
+  lv_obj_set_style_text_font(lbl_ep_title, FOCAL_FONT, 0);
+
+  lv_obj_t *lbl_ep_hint = lv_label_create(s_mon_empty_placeholder);
+  lv_label_set_text(lbl_ep_hint, "Selecciona un archivo\npara iniciar el corte");
+  lv_obj_set_style_text_color(lbl_ep_hint, lv_color_hex(0x6B7280), 0);
+  lv_obj_set_style_text_font(lbl_ep_hint, FOCAL_FONT, 0);
+  lv_obj_set_style_text_align(lbl_ep_hint, LV_TEXT_ALIGN_CENTER, 0);
 
   // -------------------------------------------------------------------------
   // RIGHT CARD: SYMMETRICAL CONTROL STACK (240 x 264 px at x=230, y=46)
@@ -2270,6 +2507,106 @@ static void create_cut_monitor_screen(void) {
   lv_obj_add_event_cb(sbtn_stop, on_stop_modal_confirm_cb, LV_EVENT_CLICKED,
                       NULL);
   s_stop_modal_stop_lbl = lv_obj_get_child(sbtn_stop, 1);
+
+  // =========================================================================
+  // SYMMETRICAL NOTIFICATION MODAL FOR JOB COMPLETION (CENTERED OVERLAY)
+  // =========================================================================
+  s_complete_modal = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(s_complete_modal, 480, 320);
+  lv_obj_set_pos(s_complete_modal, 0, 0);
+  lv_obj_set_style_bg_color(s_complete_modal, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(s_complete_modal, LV_OPA_70, 0);
+  lv_obj_clear_flag(s_complete_modal, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_complete_modal, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t *cdiag = lv_obj_create(s_complete_modal);
+  lv_obj_set_size(cdiag, 360, 210);
+  lv_obj_center(cdiag);
+  lv_obj_add_style(cdiag, &focal_style_card, 0);
+  lv_obj_clear_flag(cdiag, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(cdiag, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(cdiag, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_all(cdiag, 16, 0);
+  lv_obj_set_style_pad_row(cdiag, 10, 0);
+
+  focal_create_icon(cdiag, &focal_icon_check, FOCAL_HEX_PASTEL_MINT);
+
+  lv_obj_t *lbl_ctitle = lv_label_create(cdiag);
+  lv_label_set_text(lbl_ctitle, "Corte Completado");
+  lv_obj_set_style_text_color(lbl_ctitle, FOCAL_COLOR_PASTEL_MINT, 0);
+  lv_obj_set_style_text_font(lbl_ctitle, FOCAL_FONT, 0);
+
+  s_complete_modal_info_lbl = lv_label_create(cdiag);
+  lv_label_set_text(s_complete_modal_info_lbl,
+                    "El trabajo de corte finalizo con exito.");
+  lv_obj_set_style_text_color(
+      s_complete_modal_info_lbl,
+      s_is_dark ? lv_color_hex(0xD1D5DB) : lv_color_hex(0x374151), 0);
+  lv_obj_set_style_text_font(s_complete_modal_info_lbl, FOCAL_FONT, 0);
+  lv_obj_set_style_text_align(s_complete_modal_info_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_width(s_complete_modal_info_lbl, 320);
+
+  lv_obj_t *cbtn_ok = focal_create_btn(cdiag, 140, 38, &focal_icon_check,
+                                       "Aceptar", &focal_style_btn_mint,
+                                       0xFFFFFF);
+  lv_obj_add_event_cb(cbtn_ok, on_complete_modal_accept_cb, LV_EVENT_CLICKED,
+                      NULL);
+
+  // =========================================================================
+  // GLOBAL MODAL FOR WIRELESS FILE UPLOAD (WITH REAL-TIME PROGRESS BAR)
+  // =========================================================================
+  s_upload_modal = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(s_upload_modal, 480, 320);
+  lv_obj_set_pos(s_upload_modal, 0, 0);
+  lv_obj_set_style_bg_color(s_upload_modal, lv_color_hex(0x000000), 0);
+  lv_obj_set_style_bg_opa(s_upload_modal, LV_OPA_70, 0);
+  lv_obj_clear_flag(s_upload_modal, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(s_upload_modal, LV_OBJ_FLAG_HIDDEN);
+
+  lv_obj_t *updiag = lv_obj_create(s_upload_modal);
+  lv_obj_set_size(updiag, 360, 200);
+  lv_obj_center(updiag);
+  lv_obj_add_style(updiag, &focal_style_card, 0);
+  lv_obj_clear_flag(updiag, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(updiag, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(updiag, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_all(updiag, 16, 0);
+  lv_obj_set_style_pad_row(updiag, 10, 0);
+
+  focal_create_icon(updiag, &focal_icon_wifi, FOCAL_HEX_PASTEL_BLUE);
+
+  lv_obj_t *lbl_uptitle = lv_label_create(updiag);
+  lv_label_set_text(lbl_uptitle, "Recibiendo Archivo G-code...");
+  lv_obj_set_style_text_color(lbl_uptitle, FOCAL_COLOR_PASTEL_BLUE, 0);
+  lv_obj_set_style_text_font(lbl_uptitle, FOCAL_FONT, 0);
+
+  s_upload_file_lbl = lv_label_create(updiag);
+  lv_label_set_text(s_upload_file_lbl, "corte.gcode");
+  lv_obj_set_style_text_color(
+      s_upload_file_lbl,
+      s_is_dark ? lv_color_hex(0xD1D5DB) : lv_color_hex(0x374151), 0);
+  lv_obj_set_style_text_font(s_upload_file_lbl, FOCAL_FONT, 0);
+  lv_obj_set_style_text_align(s_upload_file_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_width(s_upload_file_lbl, 320);
+
+  s_upload_bar = lv_bar_create(updiag);
+  lv_obj_set_size(s_upload_bar, 310, 14);
+  lv_bar_set_range(s_upload_bar, 0, 100);
+  lv_bar_set_value(s_upload_bar, 0, LV_ANIM_OFF);
+  lv_obj_set_style_bg_color(s_upload_bar, s_is_dark ? lv_color_hex(0x1F2430) : lv_color_hex(0xE5E7EB), 0);
+  lv_obj_set_style_bg_color(s_upload_bar, FOCAL_COLOR_PASTEL_BLUE, LV_PART_INDICATOR);
+  lv_obj_set_style_radius(s_upload_bar, FOCAL_RADIUS_S, 0);
+  lv_obj_set_style_radius(s_upload_bar, FOCAL_RADIUS_S, LV_PART_INDICATOR);
+
+  s_upload_pct_lbl = lv_label_create(updiag);
+  lv_label_set_text(s_upload_pct_lbl, "0% (0 KB)");
+  lv_obj_set_style_text_color(s_upload_pct_lbl, s_is_dark ? lv_color_hex(0x9CA3AF) : lv_color_hex(0x6B7280), 0);
+  lv_obj_set_style_text_align(s_upload_pct_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+  // Inicializar la pantalla de monitor en estado reposo por defecto
+  ui_set_monitor_idle_internal();
 }
 
 // =============================================================================
@@ -5296,4 +5633,105 @@ void ui_show_calib_success_modal(void) {
     lv_obj_move_foreground(s_calib_success_modal);
   }
 }
+
+void ui_set_monitor_idle(void) {
+  if (lvgl_port_lock(100)) {
+    ui_set_monitor_idle_internal();
+    lvgl_port_unlock();
+  }
+}
+
+void ui_show_complete_modal(const char *filename, uint32_t total_sec, uint32_t total_lines) {
+  if (!s_complete_modal) return;
+  if (s_complete_modal_info_lbl) {
+    char buf[128];
+    uint32_t m = total_sec / 60;
+    uint32_t s = total_sec % 60;
+    const char *name = (filename && strlen(filename) > 0) ? filename : "Trabajo";
+    snprintf(buf, sizeof(buf),
+             "El archivo '%s' ha finalizado con exito.\nTiempo: %02u:%02u min  |  Lineas: %u",
+             name, (unsigned)m, (unsigned)s, (unsigned)total_lines);
+    lv_label_set_text(s_complete_modal_info_lbl, buf);
+  }
+  lv_obj_clear_flag(s_complete_modal, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_move_foreground(s_complete_modal);
+}
+
+void ui_notify_upload_start(const char *filename, size_t total_bytes) {
+  if (lvgl_port_lock(100)) {
+    if (s_upload_modal) {
+      if (s_upload_file_lbl) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "%s (%.1f KB)", filename ? filename : "corte.gcode", (float)total_bytes / 1024.0f);
+        lv_label_set_text(s_upload_file_lbl, buf);
+      }
+      if (s_upload_bar) {
+        lv_bar_set_value(s_upload_bar, 0, LV_ANIM_OFF);
+      }
+      if (s_upload_pct_lbl) {
+        lv_label_set_text(s_upload_pct_lbl, "Iniciando recepción...");
+      }
+      lv_obj_clear_flag(s_upload_modal, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_move_foreground(s_upload_modal);
+    }
+    lvgl_port_unlock();
+  }
+}
+
+void ui_notify_upload_progress(size_t received_bytes, size_t total_bytes) {
+  if (lvgl_port_lock(50)) {
+    if (s_upload_bar && total_bytes > 0) {
+      int pct = (int)(((float)received_bytes / (float)total_bytes) * 100.0f);
+      if (pct > 100) pct = 100;
+      lv_bar_set_value(s_upload_bar, pct, LV_ANIM_OFF);
+      if (s_upload_pct_lbl) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%d%% (%.1f / %.1f KB)", pct,
+                 (float)received_bytes / 1024.0f, (float)total_bytes / 1024.0f);
+        lv_label_set_text(s_upload_pct_lbl, buf);
+      }
+    }
+    lvgl_port_unlock();
+  }
+}
+
+void ui_notify_upload_complete(const char *filename) {
+  if (lvgl_port_lock(100)) {
+    if (s_upload_modal) {
+      lv_obj_add_flag(s_upload_modal, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (filename && strlen(filename) > 0) {
+      strncpy(s_pending_cut_file, filename, sizeof(s_pending_cut_file) - 1);
+      s_pending_cut_file[sizeof(s_pending_cut_file) - 1] = '\0';
+      ui_switch_screen(UI_SCREEN_CUT_MONITOR);
+      ui_set_monitor_idle_internal();
+      if (s_mon_lbl_filename) {
+        lv_label_set_text(s_mon_lbl_filename, s_pending_cut_file);
+        lv_obj_set_style_text_color(s_mon_lbl_filename, FOCAL_COLOR_PASTEL_BLUE, 0);
+      }
+      ui_update_status("LISTO PARA CORTE", FOCAL_HEX_PASTEL_MINT);
+    }
+    lvgl_port_unlock();
+  }
+}
+
+bool ui_start_cut_job_from_network(const char *filename) {
+  if (gcode_streamer_is_running()) return false;
+
+  if (filename && strlen(filename) > 0) {
+    strncpy(s_pending_cut_file, filename, sizeof(s_pending_cut_file) - 1);
+    s_pending_cut_file[sizeof(s_pending_cut_file) - 1] = '\0';
+  }
+
+  if (lvgl_port_lock(200)) {
+    ui_switch_screen(UI_SCREEN_CUT_MONITOR);
+    ui_set_monitor_cutting_internal(s_pending_cut_file);
+    ui_set_cutting_state(true);
+    ui_update_status("CORTANDO", FOCAL_HEX_PASTEL_MINT);
+    lvgl_port_unlock();
+  }
+
+  return gcode_streamer_start(s_pending_cut_file, on_streamer_progress_cb, on_streamer_complete_cb);
+}
+
 

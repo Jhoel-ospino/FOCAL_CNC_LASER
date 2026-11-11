@@ -90,14 +90,17 @@ extern "C" {
 // Motor paso a paso estándar de 1.8° = 200 pasos/revolución.
 // Con microstepping a 16x (MS1=3.3V, MS2=3.3V): 200 * 16 = 3200 micropasos/rev -> 400.0 pasos/mm.
 // Con microstepping a 8x (MS1=NC, MS2=NC): 200 * 8 = 1600 micropasos/rev -> 200.0 pasos/mm.
-#define CNC_DEFAULT_X_STEPS_PER_MM   400.0f
-#define CNC_DEFAULT_Y_STEPS_PER_MM   400.0f
+// Calibración experimental real medida por el usuario:
+// Eje Y: 20000 pasos / 100.0 mm medidos = 200.0 pasos/mm
+// Eje X: 20000 pasos / 97.5 mm medidos = 205.13 pasos/mm
+#define CNC_DEFAULT_X_STEPS_PER_MM   205.13f
+#define CNC_DEFAULT_Y_STEPS_PER_MM   200.0f
 
-#define CNC_MAX_TRAVEL_X_MM          200.0f
-#define CNC_MAX_TRAVEL_Y_MM          160.0f
+#define CNC_MAX_TRAVEL_X_MM          102.0f
+#define CNC_MAX_TRAVEL_Y_MM          82.0f
 
-#define CNC_DEFAULT_MAX_FEEDRATE     4000.0f // mm/min (óptimo para husillos T8)
-#define CNC_DEFAULT_ACCELERATION     800.0f  // mm/s^2
+#define CNC_DEFAULT_MAX_FEEDRATE     800.0f  // mm/min (optimo anti-resonancia para husillos T8)
+#define CNC_DEFAULT_ACCELERATION     60.0f   // mm/s^2 (rampa suave S-curve con jerk nulo)
 
 #ifdef __cplusplus
 }

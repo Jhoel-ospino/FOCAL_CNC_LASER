@@ -36,15 +36,15 @@ static const machine_settings_t s_defaults = {
     .laser_delay_ms = 50,
     .laser_test_power = 1, // 1% para encuadre visible sin quemar
 
-    // Kinematics / GRBL Defaults
-    .steps_per_mm_x = 400.0f,
-    .steps_per_mm_y = 400.0f,
-    .max_rate_x = 6000.0f,
-    .max_rate_y = 6000.0f,
-    .accel_x = 500.0f,
-    .accel_y = 500.0f,
-    .travel_max_x = 200.0f,
-    .travel_max_y = 160.0f,
+    // Kinematics / GRBL Defaults (Calibrado 200 steps/mm 1/8 microstepping T8x8)
+    .steps_per_mm_x = 205.13f,
+    .steps_per_mm_y = 200.0f,
+    .max_rate_x = 800.0f,   // mm/min (optimizado anti-resonancia para 42BYGHW609)
+    .max_rate_y = 1000.0f,  // mm/min (Dual-Y paralelo suave)
+    .accel_x = 40.0f,       // mm/s^2 (rampa suave S-curve anti-ruido en motor X)
+    .accel_y = 60.0f,       // mm/s^2 (rampa suave Dual-Y)
+    .travel_max_x = 102.0f,
+    .travel_max_y = 82.0f,
     .bed_rotation = 0,
 
     // Optical Focus
@@ -91,10 +91,33 @@ esp_err_t settings_manager_init(void)
         nvs_set_blob(handle, NVS_BLOB_KEY, &s_settings, sizeof(machine_settings_t));
         nvs_commit(handle);
     } else if (err == ESP_OK) {
+        bool need_commit = false;
+        // Auto-saneamiento y calibración de pasos/mm (1/8 microstepping T8x8)
+        if (s_settings.steps_per_mm_x > 250.0f || s_settings.steps_per_mm_x < 100.0f) {
+            s_settings.steps_per_mm_x = 205.13f;
+            need_commit = true;
+        }
+        if (s_settings.steps_per_mm_y > 250.0f || s_settings.steps_per_mm_y < 100.0f) {
+            s_settings.steps_per_mm_y = 200.0f;
+            need_commit = true;
+        }
+        if (s_settings.accel_x > 50.0f || s_settings.accel_x < 10.0f) { s_settings.accel_x = 40.0f; need_commit = true; }
+        if (s_settings.accel_y > 80.0f || s_settings.accel_y < 10.0f) { s_settings.accel_y = 60.0f; need_commit = true; }
+        if (s_settings.max_rate_x > 1000.0f || s_settings.max_rate_x < 200.0f) { s_settings.max_rate_x = 800.0f; need_commit = true; }
+        if (s_settings.max_rate_y > 1200.0f || s_settings.max_rate_y < 200.0f) { s_settings.max_rate_y = 1000.0f; need_commit = true; }
+        if (s_settings.travel_max_x > 105.0f || s_settings.travel_max_x < 30.0f) { s_settings.travel_max_x = 102.0f; need_commit = true; }
+        if (s_settings.travel_max_y > 85.0f || s_settings.travel_max_y < 30.0f) { s_settings.travel_max_y = 82.0f; need_commit = true; }
+
+        if (need_commit) {
+            nvs_set_blob(handle, NVS_BLOB_KEY, &s_settings, sizeof(machine_settings_t));
+            nvs_commit(handle);
+            ESP_LOGI(TAG, "Configuraciones NVS actualizadas con calibracion 200 steps/mm.");
+        }
+
         ESP_LOGI(TAG, "Configuraciones cargadas exitosamente de NVS Flash.");
-        ESP_LOGI(TAG, "  Wi-Fi SSID: '%s', STA: %d, Láser Freq: %u Hz, Steps/mm X: %.1f",
+        ESP_LOGI(TAG, "  Wi-Fi SSID: '%s', STA: %d, Láser Freq: %u Hz, Steps/mm X: %.1f, Accel: %.1f",
                  s_settings.wifi_ssid, s_settings.wifi_sta_enabled,
-                 s_settings.laser_pwm_freq, s_settings.steps_per_mm_x);
+                 s_settings.laser_pwm_freq, s_settings.steps_per_mm_x, s_settings.accel_x);
     } else {
         ESP_LOGE(TAG, "Error leyendo NVS blob: %s. Usando defaults.", esp_err_to_name(err));
         s_settings = s_defaults;

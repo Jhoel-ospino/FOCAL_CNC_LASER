@@ -5,13 +5,20 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 #include "web_server.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "planner.h"
 #include "stepper_timer.h"
 #include "gcode_parser.h"
+#include "gcode_streamer.h"
+#include "laser_driver.h"
 #include "sd_card.h"
+#include "focal_theme.h"
+#include "ui_screens.h"
 
 static const char *TAG = "WEB_SERVER";
 static httpd_handle_t s_server = NULL;
@@ -158,19 +165,36 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     planner_get_position(&cur_x, &cur_y);
 
     const char *state_str = "Idle";
-    switch (stepper_timer_get_state()) {
-        case CNC_STATE_RUN:   state_str = "Run"; break;
-        case CNC_STATE_HOLD:  state_str = "Hold"; break;
-        case CNC_STATE_ALARM: state_str = "Alarm"; break;
-        default:              state_str = "Idle"; break;
+    gcode_streamer_status_t stream_stat;
+    gcode_streamer_get_status(&stream_stat);
+
+    if (stream_stat.is_running) {
+        state_str = stream_stat.is_paused ? "Hold" : "Run";
+    } else {
+        switch (stepper_timer_get_state()) {
+            case CNC_STATE_RUN:   state_str = "Run"; break;
+            case CNC_STATE_HOLD:  state_str = "Hold"; break;
+            case CNC_STATE_ALARM: state_str = "Alarm"; break;
+            default:              state_str = "Idle"; break;
+        }
     }
 
     uint32_t buf_avail = PLANNER_BUFFER_SIZE - planner_get_block_count();
+    uint8_t laser_pwr = laser_get_percent();
 
-    char json_buf[192];
+    char json_buf[416];
     snprintf(json_buf, sizeof(json_buf),
-             "{\"state\":\"%s\",\"wx\":%.3f,\"wy\":%.3f,\"wz\":0.000,\"feed\":1200,\"laser\":0,\"buffer\":%lu}",
-             state_str, cur_x, cur_y, buf_avail);
+             "{\"state\":\"%s\",\"storage\":\"flash\",\"wx\":%.3f,\"wy\":%.3f,\"wz\":0.000,\"feed\":1200,\"laser\":%u,\"buffer\":%lu,"
+             "\"job_running\":%s,\"job_paused\":%s,\"job_file\":\"%s\",\"progress\":%.1f,\"elapsed\":%lu,"
+             "\"current_line\":%lu,\"total_lines\":%lu}",
+             state_str, cur_x, cur_y, (unsigned int)laser_pwr, (unsigned long)buf_avail,
+             stream_stat.is_running ? "true" : "false",
+             stream_stat.is_paused ? "true" : "false",
+             stream_stat.filepath,
+             stream_stat.progress_pct,
+             (unsigned long)stream_stat.elapsed_sec,
+             (unsigned long)stream_stat.current_line,
+             (unsigned long)stream_stat.total_lines);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -208,11 +232,238 @@ static esp_err_t files_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t upload_post_handler(httpd_req_t *req)
+{
+    if (gcode_streamer_is_running()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "A cut job is currently active. Upload rejected.");
+        return ESP_FAIL;
+    }
+
+    char filename[128] = {0};
+
+    // 1. Intentar obtener el nombre del archivo desde la query "?filename=..."
+    char query[256];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "filename", filename, sizeof(filename));
+    }
+
+    // 2. Intentar desde cabecera HTTP "X-Filename"
+    if (strlen(filename) == 0) {
+        httpd_req_get_hdr_value_str(req, "X-Filename", filename, sizeof(filename));
+    }
+
+    // 3. Fallback a nombre con timestamp si no se proporcionó
+    if (strlen(filename) == 0) {
+        snprintf(filename, sizeof(filename), "corte_%lu.gcode", (unsigned long)(esp_timer_get_time() / 1000000));
+    }
+
+    char filepath[160];
+    snprintf(filepath, sizeof(filepath), "%s/%s", SD_MOUNT_POINT, filename);
+    ESP_LOGI(TAG, "Iniciando recepción de archivo en memoria Flash interna: '%s' (%zu bytes esperados)...", filepath, req->content_len);
+
+    FILE *fp = fopen(filepath, "wb");
+    if (!fp) {
+        ESP_LOGE(TAG, "No se pudo abrir '%s' para escritura en memoria Flash", filepath);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Notificar a la pantalla que la recepción inalámbrica ha comenzado
+    ui_notify_upload_start(filename, req->content_len);
+
+    char *buf = malloc(4096);
+    if (!buf) {
+        fclose(fp);
+        httpd_resp_send_500(req);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t remaining = req->content_len;
+    size_t total_written = 0;
+    bool is_first_chunk = true;
+    char boundary_str[80] = {0};
+
+    while (remaining > 0) {
+        int to_read = (remaining > 4096) ? 4096 : remaining;
+        int received = httpd_req_recv(req, buf, to_read);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            ESP_LOGE(TAG, "Error en recepción HTTP tras escribir %zu bytes", total_written);
+            fclose(fp);
+            free(buf);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+
+        char *write_ptr = buf;
+        int write_len = received;
+
+        // Si viene envuelto en multipart/form-data, omitir cabeceras hasta \r\n\r\n
+        if (is_first_chunk) {
+            is_first_chunk = false;
+            if (received >= 4 && buf[0] == '-' && buf[1] == '-') {
+                // Capturar boundary si existe
+                char *line_end = strstr(buf, "\r\n");
+                if (line_end && (line_end - buf) < (int)sizeof(boundary_str)) {
+                    strncpy(boundary_str, buf, line_end - buf);
+                    boundary_str[line_end - buf] = '\0';
+                }
+
+                char *body_start = strstr(buf, "\r\n\r\n");
+                if (body_start) {
+                    body_start += 4;
+                    write_ptr = body_start;
+                    write_len = received - (body_start - buf);
+                }
+            }
+        }
+
+        // Si es el último chunk y contiene multipart closing boundary, recortarlo
+        if (remaining == (size_t)received && strlen(boundary_str) > 0) {
+            char *bound_pos = strstr(write_ptr, boundary_str);
+            if (!bound_pos) {
+                bound_pos = strstr(write_ptr, "--");
+            }
+            if (bound_pos && bound_pos > write_ptr) {
+                // Retroceder \r\n anterior al boundary
+                if (bound_pos >= write_ptr + 2 && *(bound_pos - 2) == '\r' && *(bound_pos - 1) == '\n') {
+                    bound_pos -= 2;
+                }
+                write_len = bound_pos - write_ptr;
+            }
+        }
+
+        if (write_len > 0) {
+            fwrite(write_ptr, 1, write_len, fp);
+            total_written += write_len;
+            ui_notify_upload_progress(total_written, req->content_len);
+        }
+        remaining -= received;
+    }
+
+    fclose(fp);
+    free(buf);
+    ESP_LOGI(TAG, "Archivo '%s' transferido exitosamente a Flash (%zu bytes)", filename, total_written);
+
+    // Notificar a la pantalla LVGL que la descarga finalizó y transicionar al Monitor de Corte
+    ui_notify_upload_complete(filename);
+
+    char resp_json[192];
+    snprintf(resp_json, sizeof(resp_json),
+             "{\"success\":true,\"filename\":\"%s\",\"storage\":\"flash\",\"bytes\":%zu}",
+             filename, total_written);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, resp_json, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t job_start_post_handler(httpd_req_t *req)
+{
+    char body[128] = {0};
+    int ret = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (ret > 0) {
+        body[ret] = '\0';
+    }
+
+    char filename[96] = {0};
+
+    // Intentar extraer de query "?filename=..."
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        httpd_query_key_value(query, "filename", filename, sizeof(filename));
+    }
+
+    // Si no está en query, extraer del body (JSON {"filename":"..."} o plano "nombre.gcode")
+    if (strlen(filename) == 0 && strlen(body) > 0) {
+        char *p = strstr(body, "\"filename\":");
+        if (p) {
+            p += 11;
+            while (*p == ' ' || *p == '\"') p++;
+            char *end = p;
+            while (*end != '\0' && *end != '\"' && *end != '}' && *end != '\r' && *end != '\n') end++;
+            size_t l = end - p;
+            if (l < sizeof(filename)) {
+                strncpy(filename, p, l);
+                filename[l] = '\0';
+            }
+        } else {
+            // Nombre en texto plano
+            char *p2 = body;
+            while (isspace((unsigned char)*p2)) p2++;
+            char *end = p2;
+            while (*end != '\0' && !isspace((unsigned char)*end)) end++;
+            size_t l = end - p2;
+            if (l < sizeof(filename)) {
+                strncpy(filename, p2, l);
+                filename[l] = '\0';
+            }
+        }
+    }
+
+    if (strlen(filename) == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Filename is required");
+        return ESP_FAIL;
+    }
+
+    if (gcode_streamer_is_running()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "A cut job is already running");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Iniciando corte de archivo: '%s'...", filename);
+    bool ok = ui_start_cut_job_from_network(filename);
+
+    char resp[160];
+    snprintf(resp, sizeof(resp), "{\"success\":%s,\"file\":\"%s\"}", ok ? "true" : "false", filename);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t job_pause_post_handler(httpd_req_t *req)
+{
+    gcode_streamer_pause(true);
+    ui_update_status("PAUSA", FOCAL_HEX_PASTEL_AMBER);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, "{\"success\":true,\"paused\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t job_resume_post_handler(httpd_req_t *req)
+{
+    gcode_streamer_pause(false);
+    ui_update_status("CORTANDO", FOCAL_HEX_PASTEL_MINT);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, "{\"success\":true,\"paused\":false}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+static esp_err_t job_stop_post_handler(httpd_req_t *req)
+{
+    gcode_streamer_stop();
+    ui_set_cutting_state(false);
+    ui_set_monitor_idle();
+    ui_update_status("DETENIDO", FOCAL_HEX_PASTEL_RED);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, "{\"success\":true,\"stopped\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 void web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 8;
-    config.stack_size = 8192;
+    config.max_uri_handlers = 16;
+    config.stack_size = 10240;
 
     ESP_LOGI(TAG, "Starting HTTP Web Server on port %d...", config.server_port);
     if (httpd_start(&s_server, &config) == ESP_OK) {
@@ -228,7 +479,22 @@ void web_server_start(void)
         httpd_uri_t uri_files = { .uri = "/files", .method = HTTP_GET, .handler = files_get_handler };
         httpd_register_uri_handler(s_server, &uri_files);
 
-        ESP_LOGI(TAG, "HTTP Web Server started successfully.");
+        httpd_uri_t uri_upload = { .uri = "/upload", .method = HTTP_POST, .handler = upload_post_handler };
+        httpd_register_uri_handler(s_server, &uri_upload);
+
+        httpd_uri_t uri_job_start = { .uri = "/job/start", .method = HTTP_POST, .handler = job_start_post_handler };
+        httpd_register_uri_handler(s_server, &uri_job_start);
+
+        httpd_uri_t uri_job_pause = { .uri = "/job/pause", .method = HTTP_POST, .handler = job_pause_post_handler };
+        httpd_register_uri_handler(s_server, &uri_job_pause);
+
+        httpd_uri_t uri_job_resume = { .uri = "/job/resume", .method = HTTP_POST, .handler = job_resume_post_handler };
+        httpd_register_uri_handler(s_server, &uri_job_resume);
+
+        httpd_uri_t uri_job_stop = { .uri = "/job/stop", .method = HTTP_POST, .handler = job_stop_post_handler };
+        httpd_register_uri_handler(s_server, &uri_job_stop);
+
+        ESP_LOGI(TAG, "HTTP Web Server and API endpoints registered successfully.");
     }
 }
 

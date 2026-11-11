@@ -112,7 +112,7 @@ void app_main(void)
     ESP_LOGI(TAG, "==================================================");
     ESP_LOGI(TAG, "   FOCAL CNC 20W LASER CUTTER FIRMWARE v1.0.0    ");
     ESP_LOGI(TAG, "   Target: ESP32-S3 N16R8 (Xtensa Dual-Core)      ");
-    ESP_LOGI(TAG, "   Bed Size: 400x400 mm | T8x8 (400 steps/mm)     ");
+    ESP_LOGI(TAG, "   Bed Size: 102x82 mm | T8x8 (200 steps/mm)      ");
     ESP_LOGI(TAG, "   Design System: focal-design-system (Apple-like)");
     ESP_LOGI(TAG, "==================================================");
 

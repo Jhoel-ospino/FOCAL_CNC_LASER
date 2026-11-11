@@ -47,7 +47,7 @@ static void planner_recalculate_lookahead(void)
     // Trapezoidal lookahead backward/forward pass
     if (s_count <= 1) return;
 
-    // Backward pass
+    // Backward pass: propaga el frenado seguro desde el final hacia el inicio
     for (int i = (int)s_count - 1; i > 0; i--) {
         uint32_t idx_curr = (s_tail + i) % PLANNER_BUFFER_SIZE;
         uint32_t idx_prev = (s_tail + i - 1) % PLANNER_BUFFER_SIZE;
@@ -65,7 +65,7 @@ static void planner_recalculate_lookahead(void)
         }
     }
 
-    // Forward pass
+    // Forward pass: propaga la aceleración alcanzable desde el inicio hacia el final
     for (uint32_t i = 0; i < s_count; i++) {
         uint32_t idx = (s_tail + i) % PLANNER_BUFFER_SIZE;
         plan_block_t *blk = &s_block_buffer[idx];
@@ -73,6 +73,14 @@ static void planner_recalculate_lookahead(void)
         float max_exit = sqrtf(blk->entry_speed * blk->entry_speed + 2.0f * blk->acceleration * blk->millimeters);
         if (blk->exit_speed > max_exit) blk->exit_speed = max_exit;
         if (blk->exit_speed > blk->nominal_speed) blk->exit_speed = blk->nominal_speed;
+
+        if (i + 1 < s_count) {
+            uint32_t next_idx = (s_tail + i + 1) % PLANNER_BUFFER_SIZE;
+            plan_block_t *next = &s_block_buffer[next_idx];
+            if (next->entry_speed > blk->exit_speed) {
+                next->entry_speed = blk->exit_speed;
+            }
+        }
     }
 }
 
@@ -88,9 +96,8 @@ bool planner_buffer_line(float target_x, float target_y, float feedrate, uint16_
     // Obtener límites y resolución de configuraciones persistentes (NVS)
     float max_x = BED_MAX_X;
     float max_y = BED_MAX_Y;
-    float steps_x_per_mm = DEFAULT_STEPS_PER_MM;
-    float steps_y_per_mm = DEFAULT_STEPS_PER_MM;
-    float default_accel = DEFAULT_ACCELERATION;
+    float steps_x_per_mm = DEFAULT_STEPS_PER_MM_X;
+    float steps_y_per_mm = DEFAULT_STEPS_PER_MM_Y;
 
     machine_settings_t cfg;
     settings_manager_get(&cfg);
@@ -98,7 +105,11 @@ bool planner_buffer_line(float target_x, float target_y, float feedrate, uint16_
     if (cfg.travel_max_y > 0.0f) max_y = cfg.travel_max_y;
     if (cfg.steps_per_mm_x > 0.0f) steps_x_per_mm = cfg.steps_per_mm_x;
     if (cfg.steps_per_mm_y > 0.0f) steps_y_per_mm = cfg.steps_per_mm_y;
-    if (cfg.accel_x > 0.0f) default_accel = cfg.accel_x;
+
+    float accel_x = (cfg.accel_x >= 10.0f && cfg.accel_x <= 150.0f) ? cfg.accel_x : DEFAULT_ACCELERATION;
+    float accel_y = (cfg.accel_y >= 10.0f && cfg.accel_y <= 150.0f) ? cfg.accel_y : DEFAULT_ACCELERATION;
+    float max_rate_x = (cfg.max_rate_x >= 200.0f && cfg.max_rate_x <= 1500.0f) ? cfg.max_rate_x : DEFAULT_MAX_FEEDRATE;
+    float max_rate_y = (cfg.max_rate_y >= 200.0f && cfg.max_rate_y <= 1500.0f) ? cfg.max_rate_y : DEFAULT_MAX_FEEDRATE;
 
     // Soft limits clamp
     if (target_x < 0.0f) target_x = 0.0f;
@@ -118,14 +129,45 @@ bool planner_buffer_line(float target_x, float target_y, float feedrate, uint16_
         return true;
     }
 
+    // Vector unitario del segmento
+    float unit_vec_x = dx / dist;
+    float unit_vec_y = dy / dist;
+    float ux_abs = fabsf(unit_vec_x);
+    float uy_abs = fabsf(unit_vec_y);
+
+    // Proyección cinemática vectorial (Estándar GRBL):
+    // Limita la aceleración del bloque para que NINGÚN motor supere su límite físico individual
+    float block_accel = accel_x;
+    if (ux_abs > 0.001f && uy_abs > 0.001f) {
+        float lim_ax = accel_x / ux_abs;
+        float lim_ay = accel_y / uy_abs;
+        block_accel = (lim_ax < lim_ay) ? lim_ax : lim_ay;
+    } else if (uy_abs > 0.001f) {
+        block_accel = accel_y;
+    } else {
+        block_accel = accel_x;
+    }
+
+    // Proyección de velocidad máxima admisible según el vector de avance
+    float max_allowed_feedrate = max_rate_x;
+    if (ux_abs > 0.001f && uy_abs > 0.001f) {
+        float lim_vx = max_rate_x / ux_abs;
+        float lim_vy = max_rate_y / uy_abs;
+        max_allowed_feedrate = (lim_vx < lim_vy) ? lim_vx : lim_vy;
+    } else if (uy_abs > 0.001f) {
+        max_allowed_feedrate = max_rate_y;
+    } else {
+        max_allowed_feedrate = max_rate_x;
+    }
+
     plan_block_t *blk = &s_block_buffer[s_head];
     memset(blk, 0, sizeof(plan_block_t));
 
     blk->millimeters = dist;
-    blk->acceleration = default_accel;
-    blk->nominal_speed = (feedrate > 0.0f ? feedrate : DEFAULT_MAX_FEEDRATE) / 60.0f; // mm/s
-    if (blk->nominal_speed > (DEFAULT_MAX_FEEDRATE / 60.0f)) {
-        blk->nominal_speed = DEFAULT_MAX_FEEDRATE / 60.0f;
+    blk->acceleration = block_accel;
+    blk->nominal_speed = (feedrate > 0.0f ? feedrate : max_allowed_feedrate) / 60.0f; // mm/s
+    if (blk->nominal_speed > (max_allowed_feedrate / 60.0f)) {
+        blk->nominal_speed = max_allowed_feedrate / 60.0f;
     }
 
     // Calcular pulsos para husillos trapezoidales T8x8
@@ -138,31 +180,38 @@ bool planner_buffer_line(float target_x, float target_y, float feedrate, uint16_
     blk->laser_power = laser_power;
     blk->dynamic_laser = dynamic_mode;
 
-    // Vector unitario del segmento
-    float unit_vec_x = dx / dist;
-    float unit_vec_y = dy / dist;
-
     // Cálculo de Junction Deviation de GRBL (Velocidad óptima de paso por esquina)
     if (s_count == 0) {
         // Arranca desde reposo
         blk->entry_speed = 0.0f;
     } else {
+        uint32_t prev_idx = (s_head + PLANNER_BUFFER_SIZE - 1) % PLANNER_BUFFER_SIZE;
+        plan_block_t *prev = &s_block_buffer[prev_idx];
+
         // Coseno del ángulo entre el vector anterior y el actual
         float cos_theta = -(s_prev_unit_vec_x * unit_vec_x + s_prev_unit_vec_y * unit_vec_y);
+        float junction_speed = 0.0f;
         if (cos_theta > 0.999999f) {
             // Ángulo agudo de 180° (reversa completa): detener a cero
-            blk->entry_speed = 0.0f;
+            junction_speed = 0.0f;
         } else {
             if (cos_theta < -0.999999f) cos_theta = -0.999999f;
             float sin_theta_d2 = sqrtf(0.5f * (1.0f - cos_theta));
             if (sin_theta_d2 < 0.999999f) {
                 float r = (JUNCTION_DEVIATION * sin_theta_d2) / (1.0f - sin_theta_d2);
-                float max_junction_speed = sqrtf(blk->acceleration * r);
-                blk->entry_speed = (max_junction_speed < blk->nominal_speed) ? max_junction_speed : blk->nominal_speed;
+                float a_junc = (prev->acceleration < blk->acceleration) ? prev->acceleration : blk->acceleration;
+                float max_junction_speed = sqrtf(a_junc * r);
+                junction_speed = (max_junction_speed < blk->nominal_speed) ? max_junction_speed : blk->nominal_speed;
             } else {
-                blk->entry_speed = blk->nominal_speed;
+                junction_speed = blk->nominal_speed;
             }
         }
+        if (junction_speed > blk->nominal_speed) junction_speed = blk->nominal_speed;
+        if (junction_speed > prev->nominal_speed) junction_speed = prev->nominal_speed;
+
+        // La velocidad de unión es compartida entre la salida del bloque previo y la entrada del actual
+        prev->exit_speed = junction_speed;
+        blk->entry_speed = junction_speed;
     }
     blk->exit_speed = 0.0f;
 

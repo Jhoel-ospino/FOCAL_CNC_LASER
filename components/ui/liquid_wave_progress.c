@@ -128,9 +128,10 @@ static void wave_clear_surfaces(liquid_wave_progress_t *wp) {
 
 // Render G-code silhouette into both buf_base (20% dim) and buf_active (100% Pastel Mint)
 static void wave_render_gcode(liquid_wave_progress_t *wp, const char *filepath) {
-    if (!wp || !filepath || !filepath[0]) return;
+    if (!wp) return;
 
     wave_clear_surfaces(wp);
+    if (!filepath || !filepath[0]) return;
 
     FILE *f = fopen(filepath, "r");
     if (!f) {
@@ -139,23 +140,7 @@ static void wave_render_gcode(liquid_wave_progress_t *wp, const char *filepath) 
         f = fopen(alt, "r");
     }
     if (!f) {
-        // Fallback demo shape (stylized laser star/heart) if file cannot be read
-        ESP_LOGW(TAG, "Cannot open '%s', drawing fallback silhouette", filepath);
-        int cx = wp->w / 2;
-        int cy = wp->h / 2;
-        int r = wp->w / 3;
-        lv_color_t col_dim = wp->is_dark ? lv_color_hex(0x2D3748) : lv_color_hex(0xD1D5DB);
-        lv_color_t col_mint = wp->is_dark ? lv_color_hex(0x34D399) : lv_color_hex(0x10B981);
-        for (int a = 0; a < 360; a += 10) {
-            float rad1 = (float)a * 3.14159f / 180.0f;
-            float rad2 = (float)(a + 10) * 3.14159f / 180.0f;
-            int x1 = cx + (int)(r * cosf(rad1));
-            int y1 = cy + (int)(r * sinf(rad1));
-            int x2 = cx + (int)(r * cosf(rad2));
-            int y2 = cy + (int)(r * sinf(rad2));
-            wave_draw_line(wp->buf_base, wp->w, wp->h, x1, y1, x2, y2, col_dim, 1);
-            wave_draw_line(wp->buf_active, wp->w, wp->h, x1, y1, x2, y2, col_mint, 2);
-        }
+        ESP_LOGW(TAG, "No se pudo abrir '%s' para silueta de avance", filepath);
         return;
     }
 
@@ -281,21 +266,22 @@ static void wave_composite_frame(liquid_wave_progress_t *wp) {
         if (wave_y < 0) wave_y = 0;
         if (wave_y >= H) wave_y = H - 1;
 
-        for (int y = 0; y < H; y++) {
-            int idx = y * W + x;
-            if (y < wave_y - 1) {
-                // Above wave: Layer 1 Base (20% dim silhouette)
-                wp->buf_display[idx] = wp->buf_base[idx];
-            } else if (y == wave_y - 1 && damp > 0.1f) {
-                // Subtle crest glow
-                wp->buf_display[idx] = crest_subtle;
-            } else if (y == wave_y && damp > 0.05f) {
-                // Luminous primary wave crest surface line
-                wp->buf_display[idx] = crest_col;
-            } else {
-                // Below wave: Layer 2 Revealed (100% vibrant Pastel Mint)
-                wp->buf_display[idx] = wp->buf_active[idx];
-            }
+        int y = 0;
+        int y_end_base = wave_y - 1;
+        if (y_end_base > H) y_end_base = H;
+        for (; y < y_end_base; y++) {
+            wp->buf_display[y * W + x] = wp->buf_base[y * W + x];
+        }
+        if (y < H && y == wave_y - 1) {
+            wp->buf_display[y * W + x] = (damp > 0.1f) ? crest_subtle : wp->buf_base[y * W + x];
+            y++;
+        }
+        if (y < H && y == wave_y) {
+            wp->buf_display[y * W + x] = (damp > 0.05f) ? crest_col : wp->buf_active[y * W + x];
+            y++;
+        }
+        for (; y < H; y++) {
+            wp->buf_display[y * W + x] = wp->buf_active[y * W + x];
         }
     }
 
@@ -320,11 +306,11 @@ liquid_wave_progress_t *liquid_wave_progress_create(lv_obj_t *parent, int16_t wi
 
     wp->w = width;
     wp->h = height;
-    wp->progress = 0.45f; // Default 45% progress
+    wp->progress = 0.0f;
     wp->wave_phase = 0.0f;
     wp->is_dark = focal_theme_is_dark();
-    wp->is_animating = false; // Solo animar cuando haya un corte en ejecucion
-    strncpy(wp->filepath, "prueba_mario.gcode", sizeof(wp->filepath) - 1);
+    wp->is_animating = false;
+    wp->filepath[0] = '\0';
 
     size_t buf_size = width * height * sizeof(lv_color_t);
     wp->buf_base = (lv_color_t *)wave_alloc(buf_size);
@@ -354,12 +340,12 @@ liquid_wave_progress_t *liquid_wave_progress_create(lv_obj_t *parent, int16_t wi
     lv_canvas_set_buffer(wp->canvas, wp->buf_display, width, height, LV_IMG_CF_TRUE_COLOR);
     lv_obj_center(wp->canvas);
 
-    // Initial G-code render & composite
+    // Initial composite (empty canvas)
     wave_render_gcode(wp, wp->filepath);
     wave_composite_frame(wp);
 
-    // Timer de animación suave a 22 FPS (45 ms) con bajo consumo de CPU
-    wp->anim_timer = lv_timer_create(wave_anim_timer_cb, 45, wp);
+    // Timer de animación suave a 10 FPS (100 ms)
+    wp->anim_timer = lv_timer_create(wave_anim_timer_cb, 100, wp);
 
     return wp;
 }
@@ -380,7 +366,11 @@ void liquid_wave_progress_set_progress(liquid_wave_progress_t *wp, float progres
     if (progress < 0.0f) progress = 0.0f;
     if (progress > 1.0f) progress = 1.0f;
     wp->progress = progress;
-    wave_composite_frame(wp);
+    // Si la animación no está activa (en reposo), actualizar el cuadro inmediatamente;
+    // si está activa, el timer de animación se encarga del refresco para no saturar CPU.
+    if (!wp->is_animating) {
+        wave_composite_frame(wp);
+    }
 }
 
 void liquid_wave_progress_set_animating(liquid_wave_progress_t *wp, bool animating) {

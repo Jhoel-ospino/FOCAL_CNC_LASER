@@ -16,11 +16,13 @@ extern "C" {
 #endif
 
 #define PLANNER_BUFFER_SIZE  32
-#define DEFAULT_STEPS_PER_MM 400.0f  // Husillo T8x8 (8mm/rev), 200 pasos, 16x microstepping = 3200 / 8 = 400
-#define DEFAULT_ACCELERATION 1500.0f // mm/s^2
-#define DEFAULT_MAX_FEEDRATE 4000.0f // mm/min (husillos)
-#define BED_MAX_X            200.0f  // 200 mm
-#define BED_MAX_Y            160.0f  // 160 mm
+#define DEFAULT_STEPS_PER_MM_X 205.13f // Husillo T8x8 (8mm/rev), 200 pasos, 8x microstepping, calibrado a 97.5mm
+#define DEFAULT_STEPS_PER_MM_Y 200.0f  // Husillo T8x8 (8mm/rev), 200 pasos, 8x microstepping, calibrado a 100mm
+#define DEFAULT_STEPS_PER_MM   200.0f  // Compatibilidad legacy
+#define DEFAULT_ACCELERATION 40.0f   // mm/s^2 (rampa suave S-curve anti-ruido para motor X y husillos T8)
+#define DEFAULT_MAX_FEEDRATE 800.0f  // mm/min (husillos T8x8 óptimo para evitar mid-band resonance a 12V)
+#define BED_MAX_X            102.0f  // 102 mm
+#define BED_MAX_Y            82.0f   // 82 mm
 
 typedef struct {
     float x;

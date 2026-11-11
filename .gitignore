@@ -12,3 +12,14 @@ managed_components/
 *.jpg
 *.jpeg
 *.png
+
+# External modules and simulation artifacts
+simulator/
+focal_studio_designer/
+grbl/
+interactive_grbl_lab/
+tft_ili9488_touch_test/
+run_simulator.sh
+screens_layout.json
+AUDIT_PROGRESS.md
+

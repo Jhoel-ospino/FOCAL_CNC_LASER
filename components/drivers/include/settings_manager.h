@@ -42,8 +42,8 @@ typedef struct {
     uint8_t laser_test_power;    // Potencia del puntero de encuadre en % (default: 1%)
 
     // 4. Parámetros Cinemáticos y Límites (GRBL)
-    float steps_per_mm_x;        // default: 400.0 steps/mm
-    float steps_per_mm_y;        // default: 400.0 steps/mm
+    float steps_per_mm_x;        // default: 205.13 steps/mm (calibrado T8x8 1/8)
+    float steps_per_mm_y;        // default: 200.0 steps/mm (calibrado T8x8 1/8)
     float max_rate_x;            // default: 6000.0 mm/min
     float max_rate_y;            // default: 6000.0 mm/min
     float accel_x;               // default: 500.0 mm/s^2

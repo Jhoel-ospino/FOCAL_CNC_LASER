@@ -5,6 +5,7 @@
 
 #include <string.h>
 #include "wifi_manager.h"
+#include "discovery_service.h"
 #include "settings_manager.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -69,6 +70,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             }
             ESP_LOGI(TAG, ">>> Conectado exitosamente! IP: %s (SSID: '%s', RSSI: %d dBm) <<<",
                      s_sta_ip, s_sta_ssid, s_sta_rssi);
+
+            // Iniciar servicio de auto-descubrimiento en la red local
+            discovery_service_start();
         }
     }
 }
@@ -92,6 +96,7 @@ void wifi_manager_init(void)
 
     // Solo creamos la interfaz Station (conectarse a routers del usuario)
     s_sta_netif = esp_netif_create_default_wifi_sta();
+    esp_netif_set_hostname(s_sta_netif, "focal-cnc");
 
     esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
     esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
