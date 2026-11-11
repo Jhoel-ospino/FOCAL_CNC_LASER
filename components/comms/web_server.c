@@ -258,6 +258,14 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
         snprintf(filename, sizeof(filename), "corte_%lu.gcode", (unsigned long)(esp_timer_get_time() / 1000000));
     }
 
+    // Sanitizar nombre de archivo para compatibilidad estricta con FATFS
+    for (int i = 0; filename[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)filename[i];
+        if (c <= 32 || c >= 127 || c == ':' || c == '/' || c == '\\' || c == '?' || c == '*' || c == '"' || c == '<' || c == '>' || c == '|') {
+            filename[i] = '_';
+        }
+    }
+
     char filepath[160];
     snprintf(filepath, sizeof(filepath), "%s/%s", SD_MOUNT_POINT, filename);
     ESP_LOGI(TAG, "Iniciando recepción de archivo en memoria Flash interna: '%s' (%zu bytes esperados)...", filepath, req->content_len);
